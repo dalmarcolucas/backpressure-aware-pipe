@@ -9,26 +9,20 @@ declare module 'fastify' {
   }
 }
 
-// A batch is processed concurrently, so COUNT doubles as the in-flight cap on
-// sink requests. The sink allows 200 req/s globally and takes 50-300ms per
-// call, so ~32 in flight is enough to keep it busy.
+// A batch is processed concurrently, so COUNT doubles as the in-flight cap on sink requests. 
 const READ_COUNT = 32
 const READ_BLOCK_MS = 5000
 
-// Retries after the initial attempt, so a single event costs at most 6 requests.
 const MAX_RETRIES = 5
 
 const DEFAULT_RECLAIM_MIN_IDLE_MS = 60_000
 const DEFAULT_RECLAIM_INTERVAL_MS = 30_000
 
-// Delay before retry n is BASE * FACTOR^(n-1): 100, 200, 400, 800, 1600ms.
 const BACKOFF_BASE_MS = 100
 const BACKOFF_FACTOR = 2
 
 /**
- * Backoff is jittered by a random 1-2x. A batch of events is sent
- * concurrently, so without jitter every in-flight request would retry in
- * lockstep and hit the sink's rate limiter together on each round.
+ * Backoff is jittered by a random 1-2x. 
  */
 function backoffDelay (retry: number): number {
   const base = BACKOFF_BASE_MS * Math.pow(BACKOFF_FACTOR, retry - 1)
@@ -111,7 +105,6 @@ const redisConsumerPlugin: FastifyPluginAsync = async (fastify) => {
     try {
       event = toSinkEvent(message)
     } catch (err) {
-      // Malformed entry: retrying can never fix it, so ack to drop it.
       fastify.log.error({ err, id }, 'Dropping unparseable stream entry')
       await client.xAck(REDIS_STREAM_KEY, REDIS_CONSUMER_GROUP, id)
       return
@@ -119,8 +112,7 @@ const redisConsumerPlugin: FastifyPluginAsync = async (fastify) => {
 
     let delivered = false
     let attempts = 0
-    // Retries live here rather than in the sink client so a shutdown can cut
-    // them short: once `running` flips we stop backing off and DLQ the entry.
+ 
     let reason = 'exhausted'
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -130,7 +122,6 @@ const redisConsumerPlugin: FastifyPluginAsync = async (fastify) => {
           break
         }
         await sleep(backoffDelay(attempt))
-        // The sleep is not cancellable, so re-check before spending a request.
         if (!running) {
           reason = 'shutdown'
           break
@@ -151,8 +142,6 @@ const redisConsumerPlugin: FastifyPluginAsync = async (fastify) => {
     }
 
     if (!delivered) {
-      // Retries are done (or were cut short by shutdown), so the entry goes to
-      // the DLQ for later inspection or replay.
       await client.xAdd(REDIS_DLQ_KEY, '*', {
         ...message,
         failed_at: String(Date.now()),
@@ -186,8 +175,6 @@ const redisConsumerPlugin: FastifyPluginAsync = async (fastify) => {
       )
       cursor = res.nextId.toString()
 
-      // Entries trimmed from the stream after being read come back as null.
-      // Redis drops them from the PEL itself, so there is nothing to deliver.
       const entries = res.messages.filter((m): m is StreamEntry => m !== null)
       claimed += entries.length
 
@@ -251,9 +238,6 @@ const redisConsumerPlugin: FastifyPluginAsync = async (fastify) => {
     }, 'Redis stream consumer started')
   })
 
-  // Retries now stop as soon as `running` flips, but the 5s BLOCK and the
-  // in-flight request itself are still not cancellable, so onClose can wait for
-  // those. Should be refactored to pass an abort signal down.
   fastify.addHook('onClose', async () => {
     running = false
     await loop
